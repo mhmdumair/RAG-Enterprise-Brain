@@ -14,6 +14,7 @@ __pycache__/
 storage/uploads/
 storage/indexes/
 storage/models/
+tasks.md
 
 # OS
 .DS_Store
