@@ -15,6 +15,15 @@ from datetime import datetime, timezone
 from core.config import settings
 
 
+# Reserved LogRecord attribute names
+RESERVED_ATTRS = {
+    'args', 'asctime', 'created', 'exc_info', 'exc_text', 'filename',
+    'funcName', 'levelname', 'levelno', 'lineno', 'module', 'msecs',
+    'message', 'msg', 'name', 'pathname', 'process', 'processName',
+    'relativeCreated', 'stack_info', 'thread', 'threadName'
+}
+
+
 class _JsonFormatter(logging.Formatter):
     """Emits each log record as a single JSON line."""
 
@@ -25,16 +34,18 @@ class _JsonFormatter(logging.Formatter):
             "logger": record.name,
             "message": record.getMessage(),
         }
+        
         # Attach any extra fields passed via extra={}
+        # Skip reserved attributes to avoid KeyError
         for key, value in record.__dict__.items():
-            if key not in (
-                "args", "asctime", "created", "exc_info", "exc_text",
-                "filename", "funcName", "id", "levelname", "levelno",
-                "lineno", "module", "msecs", "message", "msg", "name",
-                "pathname", "process", "processName", "relativeCreated",
-                "stack_info", "thread", "threadName",
-            ):
-                payload[key] = value
+            if key not in RESERVED_ATTRS and not key.startswith('_'):
+                # Handle non-serializable values
+                try:
+                    json.dumps(value)
+                    payload[key] = value
+                except (TypeError, ValueError):
+                    payload[key] = str(value)
+        
         if record.exc_info:
             payload["exc_info"] = self.formatException(record.exc_info)
         return json.dumps(payload)
