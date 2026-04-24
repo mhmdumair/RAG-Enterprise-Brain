@@ -81,21 +81,27 @@ class QAWorker:
         loop = asyncio.get_event_loop()
 
         try:
+            # Use stitched text if available (from context stitching)
+            context = chunk.stitched_text if chunk.stitched_text else chunk.text
+            
             logger.debug(
                 "Worker running",
                 extra={
                     "filename": chunk.filename,
                     "page": chunk.page_number,
                     "chunk_id": chunk.chunk_id,
+                    "context_length": len(context),
+                    "stitched": bool(chunk.stitched_text),
+                    "stitched_chunks": chunk.stitched_chunks_count,
                 },
             )
 
-            # Run CPU-bound inference in thread pool
+            # Run CPU-bound inference in thread pool with stitched context
             qa_result = await loop.run_in_executor(
                 self._executor,
                 self._model.predict,
                 question,
-                chunk.text,
+                context,  # Use stitched context!
             )
 
             return WorkerResult(

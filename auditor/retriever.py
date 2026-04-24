@@ -14,7 +14,7 @@ Flow:
       └─ list[RetrievedChunk]            → passed to worker/dispatcher
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from motor.motor_asyncio import AsyncIOMotorDatabase
 
 from core.config import settings
@@ -22,7 +22,7 @@ from core.logger import get_logger
 from core.exceptions import RetrievalError
 from brain.embedder import Embedder
 from brain.indexer import FAISSIndex
-from db.queries import get_chunks_by_vector_ids
+from db.queries import get_chunks_by_vector_ids, get_chunks_by_document_and_range
 
 logger = get_logger(__name__)
 
@@ -43,6 +43,8 @@ class RetrievedChunk:
         page_number  — source page (1-based)
         text         — chunk text (used as QA context)
         bbox         — normalized BBox for frontend highlighting
+        chunk_index  — position in document (for context stitching)
+        stitched_text — context-stitched version (if enabled)
     """
     vector_id: int
     distance: float
@@ -52,6 +54,9 @@ class RetrievedChunk:
     page_number: int
     text: str
     bbox: dict
+    chunk_index: int = 0
+    stitched_text: str = field(default="")
+    stitched_chunks_count: int = 1
 
 
 # ── Retriever ─────────────────────────────────────────────────────────────────
@@ -79,6 +84,8 @@ class Retriever:
         self,
         query: str,
         k: int | None = None,
+        stitch_context: bool = True,
+        window_size: int = 1,
     ) -> list[RetrievedChunk]:
         """
         Embed query and return top-K enriched chunks.
@@ -86,6 +93,8 @@ class Retriever:
         Args:
             query — the audit question string
             k     — override top-K (defaults to settings.top_k_chunks)
+            stitch_context — if True, fetch neighboring chunks for context
+            window_size — number of neighbor chunks to fetch on each side
 
         Returns:
             list[RetrievedChunk] ordered by relevance (closest first)
@@ -136,10 +145,15 @@ class Retriever:
                 page_number=raw.get("page_number", 0),
                 text=raw.get("text", ""),
                 bbox=raw.get("bbox", {}),
+                chunk_index=raw.get("chunk_index", 0),
             ))
 
         # Sort by distance ascending (most relevant first)
         retrieved.sort(key=lambda c: c.distance)
+
+        # ── Step 5: Context Stitching (The key improvement!) ──────────────────
+        if stitch_context:
+            retrieved = await self._stitch_context(retrieved, window_size)
 
         logger.info(
             "Retrieval complete",
@@ -147,7 +161,71 @@ class Retriever:
                 "query": query[:60],
                 "k": k,
                 "retrieved": len(retrieved),
+                "stitched": stitch_context,
             },
         )
 
         return retrieved
+
+    async def _stitch_context(
+        self, 
+        chunks: list[RetrievedChunk], 
+        window_size: int = 1
+    ) -> list[RetrievedChunk]:
+        """
+        Stitch neighboring chunks to provide broader context.
+        
+        For each retrieved chunk, fetches window_size chunks before and after
+        to create a super-chunk that bridges the context gap.
+        This allows the QA model to see both the question setup and answer.
+        """
+        if not chunks:
+            return chunks
+
+        stitched_chunks = []
+        
+        for chunk in chunks:
+            try:
+                # Fetch neighboring chunks from the same document
+                neighbors = await get_chunks_by_document_and_range(
+                    self._db,
+                    document_id=chunk.document_id,
+                    start_index=max(0, chunk.chunk_index - window_size),
+                    end_index=chunk.chunk_index + window_size + 1,
+                )
+                
+                if neighbors and len(neighbors) > 1:
+                    # Sort by chunk_index to maintain document order
+                    neighbors.sort(key=lambda x: x.get("chunk_index", 0))
+                    
+                    # Stitch texts together in order
+                    stitched_text = " ".join([n.get("text", "") for n in neighbors])
+                    
+                    # Store stitched version
+                    chunk.stitched_text = stitched_text
+                    chunk.stitched_chunks_count = len(neighbors)
+                    
+                    logger.debug(
+                        "Stitched context",
+                        extra={
+                            "chunk_id": chunk.chunk_id,
+                            "original_index": chunk.chunk_index,
+                            "neighbors": len(neighbors),
+                            "original_length": len(chunk.text),
+                            "stitched_length": len(stitched_text),
+                        }
+                    )
+                else:
+                    chunk.stitched_text = chunk.text
+                    chunk.stitched_chunks_count = 1
+                    
+            except Exception as exc:
+                logger.warning(
+                    f"Failed to stitch context for chunk {chunk.chunk_id}: {exc}"
+                )
+                chunk.stitched_text = chunk.text
+                chunk.stitched_chunks_count = 1
+            
+            stitched_chunks.append(chunk)
+        
+        return stitched_chunks

@@ -16,6 +16,7 @@ This is the single function the API route calls.
 
 from dataclasses import dataclass
 from concurrent.futures import ThreadPoolExecutor
+import re
 
 from motor.motor_asyncio import AsyncIOMotorDatabase
 import asyncio
@@ -26,7 +27,7 @@ from core.exceptions import NoAnswerFoundError
 from brain.embedder import Embedder
 from brain.indexer import FAISSIndex
 from auditor.retriever import Retriever, RetrievedChunk
-from auditor.qa_model import QAModel
+from auditor.qa_model import QAModel, QAResult
 from auditor.abstention import AbstentionFilter
 from auditor.rake_fallback import RAKEFallback
 from auditor.deduplicator import Deduplicator
@@ -118,6 +119,88 @@ class AuditDispatcher:
             extra={"workers": settings.api_workers},
         )
 
+    def _expand_answer_if_needed(self, qa_result: QAResult, chunk_text: str) -> str:
+        """
+        Intelligently expand short answers to provide more context.
+        Generic approach that works for any document.
+        
+        Strategies:
+        1. If answer is already substantial, keep it
+        2. If answer is very short, find the surrounding sentence
+        3. If answer is still short, expand to context window around answer
+        4. Fallback to first meaningful sentence from chunk
+        """
+        # Strategy 1: Keep substantial answers (over 100 chars)
+        if len(qa_result.answer) >= 100:
+            return qa_result.answer
+        
+        if not chunk_text or len(chunk_text) == 0:
+            return qa_result.answer
+        
+        # Strategy 2: Find the sentence containing the answer
+        # Split into sentences (supports ., !, ?)
+        sentences = re.split(r'(?<=[.!?])\s+', chunk_text)
+        
+        for sentence in sentences:
+            if qa_result.answer.lower() in sentence.lower():
+                cleaned = sentence.strip()
+                if len(cleaned) > len(qa_result.answer):
+                    logger.debug(
+                        "Expanded answer using surrounding sentence",
+                        extra={
+                            "original": qa_result.answer[:50],
+                            "expanded": cleaned[:100],
+                        }
+                    )
+                    return cleaned
+        
+        # Strategy 3: Get context window around the answer
+        answer_pos = chunk_text.lower().find(qa_result.answer.lower())
+        if answer_pos != -1:
+            # Get window of text (150 chars before, 200 chars after)
+            start = max(0, answer_pos - 150)
+            end = min(len(chunk_text), answer_pos + 200)
+            
+            # Expand to full sentence boundaries
+            while start > 0 and chunk_text[start] not in '.!?':
+                start -= 1
+            if start > 0:
+                start += 1  # Skip the punctuation
+            
+            while end < len(chunk_text) and chunk_text[end] not in '.!?':
+                end += 1
+            if end < len(chunk_text):
+                end += 1
+            
+            expanded = chunk_text[start:end].strip()
+            if len(expanded) > len(qa_result.answer):
+                logger.debug(
+                    "Expanded answer using context window",
+                    extra={
+                        "original": qa_result.answer[:50],
+                        "expanded": expanded[:100],
+                    }
+                )
+                return expanded
+        
+        # Strategy 4: Return first meaningful sentence from chunk
+        for sentence in sentences:
+            # Find a sentence that's not too short (more than 40 chars)
+            # and not just numbers or single words
+            cleaned = sentence.strip()
+            if len(cleaned) > 40 and not cleaned[0].isdigit():
+                logger.debug(
+                    "Using first meaningful sentence as answer",
+                    extra={"sentence": cleaned[:100]}
+                )
+                return cleaned
+        
+        # Strategy 5: Fallback to full chunk (truncated)
+        if len(chunk_text) > 300:
+            return chunk_text[:300] + "..."
+        
+        return qa_result.answer
+
     async def dispatch(self, query: str) -> DispatchResult:
         """
         Run the full audit pipeline for one query.
@@ -168,7 +251,6 @@ class AuditDispatcher:
         unique = self._deduplicator.deduplicate(accepted)
 
         # ── Build chunk lookup for source attribution ──────────────────────────
-        # Map QAResult back to its source chunk via position in worker_results
         chunk_map = self._build_chunk_map(worker_results)
 
         # ── Build VerifiedAnswer list ──────────────────────────────────────────
@@ -180,8 +262,11 @@ class AuditDispatcher:
             if source_chunk is None:
                 continue
 
+            # Expand short answers if needed (generic approach)
+            expanded_text = self._expand_answer_if_needed(qa_result, source_chunk.text)
+
             answers.append(VerifiedAnswer(
-                text=qa_result.answer,
+                text=expanded_text,
                 span_score=round(qa_result.span_score, 6),
                 null_score=round(qa_result.null_score, 6),
                 filename=source_chunk.filename,

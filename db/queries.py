@@ -131,6 +131,36 @@ async def get_chunks_by_vector_ids(
         raise DatabaseError("get_chunks_by_vector_ids", str(exc)) from exc
 
 
+async def get_chunks_by_document_and_range(
+    db: AsyncIOMotorDatabase,
+    document_id: str,
+    start_index: int,
+    end_index: int,
+) -> list[dict]:
+    """
+    Get chunks from a specific document within a range of chunk indices.
+    Used for context stitching.
+    
+    Args:
+        db: Database connection
+        document_id: The document to query
+        start_index: Starting chunk index (inclusive)
+        end_index: Ending chunk index (exclusive)
+    
+    Returns:
+        List of chunks sorted by chunk_index
+    """
+    try:
+        cursor = db["chunks"].find({
+            "document_id": document_id,
+            "chunk_index": {"$gte": start_index, "$lt": end_index}
+        }).sort("chunk_index", 1)
+        
+        return await cursor.to_list(length=None)
+    except Exception as exc:
+        raise DatabaseError("get_chunks_by_document_and_range", str(exc)) from exc
+
+
 async def delete_chunks_by_document(
     db: AsyncIOMotorDatabase,
     document_id: str,
