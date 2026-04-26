@@ -32,7 +32,7 @@ from api.dependencies import (
     set_dispatcher,
     set_pipeline,
 )
-from api.routes import health, documents, ingest, query
+from api.routes import health, documents, ingest, query, debug
 
 logger = get_logger(__name__)
 
@@ -139,6 +139,7 @@ def create_app() -> FastAPI:
     app.include_router(documents.router)
     app.include_router(ingest.router)
     app.include_router(query.router)
+    app.include_router(debug.router)
 
     return app
 

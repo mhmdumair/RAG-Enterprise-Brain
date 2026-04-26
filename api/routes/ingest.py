@@ -113,13 +113,20 @@ async def ingest_document(
             upload_path.unlink()
         raise
     
-    # Clean up temp file after successful ingestion
-    if upload_path.exists():
-        upload_path.unlink()
-        logger.debug(
-            "Uploaded file cleaned up",
-            extra={"pdf_filename": filename, "path": str(upload_path)}
+    # Move file to permanent storage after successful ingestion
+    permanent_path = Path(settings.upload_dir) / f"{result.document_id}.pdf"
+    try:
+        upload_path.rename(permanent_path)
+        logger.info(
+            "File moved to permanent storage",
+            extra={"pdf_filename": filename, "document_id": result.document_id, "path": str(permanent_path)}
         )
+    except Exception as exc:
+        logger.error(
+            "Failed to move file to permanent storage",
+            extra={"pdf_filename": filename, "error": str(exc)}
+        )
+        # Don't raise, ingestion succeeded
 
     logger.info(
         "Ingest completed successfully",

@@ -8,7 +8,8 @@ Returns metadata for every PDF that has been successfully ingested:
     status, created_at
 """
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException
+from fastapi.responses import FileResponse
 from motor.motor_asyncio import AsyncIOMotorDatabase
 
 from core.logger import get_logger
@@ -54,4 +55,51 @@ async def list_documents(
     return DocumentListResponse(
         documents=documents,
         total=len(documents),
+    )
+
+@router.delete(
+    "/documents/{document_id}",
+    summary="Delete an ingested document",
+    tags=["Documents"],
+    status_code=204,
+)
+async def delete_document(
+    document_id: str,
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    from db.queries import delete_chunks_by_document
+    from motor.motor_asyncio import AsyncIOMotorDatabase
+    await delete_chunks_by_document(db, document_id)
+    await db["documents"].delete_one({"_id": document_id})
+
+@router.get(
+    "/documents/{document_id}/file",
+    summary="Get the original PDF file",
+    tags=["Documents"],
+    response_class=FileResponse,
+)
+async def get_document_file(
+    document_id: str,
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    """
+    Return the original PDF file for the given document ID.
+    """
+    from pathlib import Path
+    from fastapi.responses import FileResponse
+    from core.config import settings
+    
+    # Check if document exists
+    doc = await db["documents"].find_one({"_id": document_id})
+    if not doc:
+        raise HTTPException(status_code=404, detail="Document not found")
+    
+    file_path = Path(settings.upload_dir) / f"{document_id}.pdf"
+    if not file_path.exists():
+        raise HTTPException(status_code=404, detail="File not found")
+    
+    return FileResponse(
+        path=file_path,
+        media_type="application/pdf",
+        filename=doc["filename"],
     )
