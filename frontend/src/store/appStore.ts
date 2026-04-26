@@ -17,7 +17,7 @@ interface AppState {
   pdfObjectUrl: string | null           // blob URL for react-pdf
 
   setActiveFile: (doc: Document | null) => void
-  setActivePage: (page: number) => void
+  setActivePage: (page: number | ((prev: number) => number)) => void
   setActiveAnswer: (answer: Answer | null) => void
   setPdfObjectUrl: (url: string | null) => void
 
@@ -42,7 +42,7 @@ export const useAppStore = create<AppState>((set) => ({
   pdfObjectUrl: null,
 
   setActiveFile: (doc) => set({ activeFile: doc, activePage: 1, activeAnswer: null }),
-  setActivePage: (page) => set({ activePage: page }),
+  setActivePage: (page) => set((state) => ({ activePage: typeof page === 'function' ? page(state.activePage) : page })),
   setActiveAnswer: (answer) => set({ activeAnswer: answer }),
   setPdfObjectUrl: (url) => set({ pdfObjectUrl: url }),
 

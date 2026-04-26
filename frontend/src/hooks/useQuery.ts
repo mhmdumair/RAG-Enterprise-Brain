@@ -35,11 +35,7 @@ export function useQuery() {
         }
       } catch (err) {
         if (err instanceof APIError) {
-          if (err.status === 404) {
-            setError("No verified answer found in the ingested documents.")
-          } else {
-            setError(err.message)
-          }
+          setError(err.message)
         } else {
           setError("Something went wrong. Please try again.")
         }
@@ -52,6 +48,7 @@ export function useQuery() {
 
   return {
     results: result?.answers ?? [],
+    currentResult: result,
     runQuery,
     isQuerying,
     error,

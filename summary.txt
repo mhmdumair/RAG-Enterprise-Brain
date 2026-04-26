@@ -1,0 +1,141 @@
+# Project Summary: RAG Enterprise Brain
+
+This file provides a file-based explanation of every file in the project. The project is a Retrieval-Augmented Generation (RAG) system for processing and querying PDF documents using vector embeddings and extractive QA.
+
+## Root Directory Files
+
+- **.env**: Environment variables file for configuration (e.g., database URIs, API keys).
+- **.env.example**: Template for environment variables, showing required settings without sensitive data.
+- **.gitignore**: Specifies files and directories to ignore in Git version control (e.g., .env, __pycache__, node_modules).
+- **README.md**: Project documentation (currently empty).
+- **ask.py**: Standalone script for querying the system, likely for testing or CLI usage.
+- **find_chunk.py**: Script to find specific chunks in the vector index or database.
+- **pytest.ini**: Configuration file for pytest testing framework.
+- **requirements-dev.txt**: Python dependencies for development (e.g., testing tools).
+- **requirements.txt**: Python dependencies for production (e.g., FastAPI, PyMuPDF, transformers).
+- **tasks.md**: Detailed task breakdown and development phases for the project.
+- **test_vector_retrieval.py**: Test script for vector retrieval functionality.
+
+## api/ Directory (FastAPI Backend)
+
+- **__init__.py**: Marks the directory as a Python package.
+- **dependencies.py**: FastAPI dependency injection functions (e.g., database client, model instances).
+- **main.py**: Main FastAPI application file, wires routes, middleware, and lifespan events.
+- **middleware.py**: FastAPI middleware for CORS, request timing, and error handling.
+- **schemas.py**: Pydantic models defining request/response schemas for API endpoints.
+- **routes/__init__.py**: Marks routes as a package.
+- **routes/debug.py**: Debug-related API routes (e.g., for testing or introspection).
+- **routes/documents.py**: API routes for document management (e.g., list ingested PDFs).
+- **routes/health.py**: Health check endpoint to verify API, DB, and models are operational.
+- **routes/ingest.py**: API route for ingesting PDF uploads and triggering the processing pipeline.
+- **routes/query.py**: API route for querying the system and returning verified answers.
+
+## auditor/ Directory (QA and Validation Layer)
+
+- **__init__.py**: Marks the directory as a Python package.
+- **abstention.py**: Implements abstention logic to accept or reject answer spans based on confidence scores.
+- **deduplicator.py**: Removes duplicate answer spans using SHA-256 hashing.
+- **dispatcher.py**: Orchestrates parallel QA workers to process chunks concurrently.
+- **qa_model.py**: Loads and runs the extractive QA model (roberta-base-squad2) for answer extraction.
+- **rake_fallback.py**: Fallback mechanism using RAKE keyword extraction to reformulate queries.
+- **retriever.py**: Performs approximate nearest neighbor search in the FAISS index to retrieve relevant chunks.
+- **worker.py**: Asynchronous worker for running QA on individual chunks.
+
+## brain/ Directory (Ingestion and Indexing)
+
+- **__init__.py**: Marks the directory as a Python package.
+- **chunker.py**: Splits parsed PDF pages into overlapping text chunks using sliding window technique.
+- **embedder.py**: Converts text chunks into vector embeddings using MiniLM-L6-v2 model.
+- **indexer.py**: Builds and persists the FAISS vector index for efficient similarity search.
+- **parser.py**: Parses PDF files using PyMuPDF to extract text blocks and bounding box coordinates.
+- **pipeline.py**: Orchestrates the full ingestion pipeline: parse → chunk → embed → index → store.
+- **store.py**: Stores chunk metadata in MongoDB, mapping vector IDs to filenames, pages, and BBoxes.
+
+## core/ Directory (Shared Utilities)
+
+- **__init__.py**: Marks the directory as a Python package.
+- **config.py**: Central configuration management for settings, environment variables, and thresholds.
+- **exceptions.py**: Custom exception classes for domain-specific errors (e.g., IngestionError, QAError).
+- **logger.py**: Structured logging setup used across all modules.
+- **utils.py**: Utility functions for text cleaning, hashing, and bounding box normalization.
+
+## db/ Directory (Database Layer)
+
+- **__init__.py**: Marks the directory as a Python package.
+- **client.py**: Asynchronous MongoDB client connection using Motor (singleton pattern).
+- **models.py**: Defines MongoDB collection schemas for documents, chunks, and results.
+- **queries.py**: Reusable database query functions (e.g., insert chunk, find by vector ID).
+
+## frontend/ Directory (Next.js Frontend)
+
+- **.env.local**: Local environment variables for the frontend.
+- **.eslintignore**: Files to ignore during ESLint checks.
+- **.gitignore**: Frontend-specific Git ignore rules.
+- **AGENTS.md**: Documentation related to AI agents or automation.
+- **CLAUDE.md**: Documentation specific to Claude AI integration.
+- **README.md**: Frontend project documentation (standard Next.js README).
+- **components.json**: Configuration for UI components (likely shadcn/ui).
+- **eslint.config.mjs**: ESLint configuration in ES modules format.
+- **next-env.d.ts**: TypeScript declarations for Next.js.
+- **next.config.ts**: Next.js configuration file.
+- **package-lock.json**: Locks dependency versions for npm.
+- **package.json**: Frontend dependencies and scripts.
+- **postcss.config.mjs**: PostCSS configuration for CSS processing.
+- **public/pdf.worker.min.js**: PDF.js worker script for PDF rendering in the browser.
+- **src/app/favicon.ico**: Favicon for the web application.
+- **src/app/globals.css**: Global CSS styles.
+- **src/app/layout.tsx**: Root layout component for the Next.js app.
+- **src/app/page.tsx**: Main page component.
+- **src/components/query/AnswerCard.tsx**: Component to display individual answer cards.
+- **src/components/query/ChatPanel.tsx**: Chat interface for queries.
+- **src/components/query/QueryHistory.tsx**: Component showing query history.
+- **src/components/query/QueryPanel.tsx**: Main query input panel.
+- **src/components/sidebar/FileItem.tsx**: Component for individual file items in sidebar.
+- **src/components/sidebar/Sidebar.tsx**: Main sidebar component.
+- **src/components/sidebar/UploadZone.tsx**: Drag-and-drop upload area for files.
+- **src/components/ui/badge.tsx**: Reusable badge UI component.
+- **src/components/ui/button.tsx**: Reusable button UI component.
+- **src/components/ui/card.tsx**: Reusable card UI component.
+- **src/components/ui/scroll-area.tsx**: Scrollable area UI component.
+- **src/components/ui/separator.tsx**: Separator UI component.
+- **src/components/ui/skeleton.tsx**: Loading skeleton UI component.
+- **src/components/ui/tooltip.tsx**: Tooltip UI component.
+- **src/components/viewer/HighlightLayer.tsx**: Component for highlighting text in PDF viewer.
+- **src/components/viewer/PDFViewer.tsx**: Main PDF viewing component.
+- **src/components/viewer/PageNavigator.tsx**: Component for navigating PDF pages.
+- **src/hooks/useDocuments.ts**: React hook for managing document state.
+- **src/hooks/usePDFViewer.ts**: React hook for PDF viewer functionality.
+- **src/hooks/useQuery.ts**: React hook for query operations.
+- **src/lib/api.ts**: API client functions for backend communication.
+- **src/lib/types.ts**: TypeScript type definitions.
+- **src/lib/utils.ts**: Utility functions for the frontend.
+- **src/store/appStore.ts**: Global state management using Zustand or similar.
+
+## storage/ Directory (Data Storage)
+
+- **indexes/brain.index**: FAISS vector index file for similarity search.
+- **models/**: Directory containing downloaded ML models (e.g., roberta-base-squad2, all-MiniLM-L6-v2).
+- **uploads/dedb611e9ae1.pdf**: Uploaded PDF file for processing.
+
+## tests/ Directory (Testing)
+
+- **__init__.py**: Marks tests as a Python package.
+- **conftest.py**: Pytest configuration and fixtures.
+- **test_abstention.py**: Tests for abstention logic.
+- **test_api.py**: Tests for API endpoints.
+- **test_embedder.py**: Tests for embedding functionality.
+- **test_parser.py**: Tests for PDF parsing.
+- **test_qa_model.py**: Tests for QA model.
+- **test_retriever.py**: Tests for vector retrieval.
+- **fixtures/test1.pdf**: Test PDF fixture.
+- **fixtures/test2.pdf**: Another test PDF fixture.
+
+## Other Directories
+
+- **.git/**: Git version control repository.
+- **.pytest_cache/**: Cache directory for pytest.
+- **.venv/**: Python virtual environment.
+- **venv/**: Another Python virtual environment (possibly duplicate).
+- **frontend/.next/**: Next.js build output directory.
+- **frontend/node_modules/**: Node.js dependencies.
+- **storage/models/.locks/**: Lock files for model downloads.

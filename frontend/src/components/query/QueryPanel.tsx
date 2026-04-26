@@ -2,11 +2,13 @@
 
 import { useState, useRef } from "react";
 import { useQuery } from "@/hooks/useQuery";
+import { useAppStore } from "@/store/appStore";
 import { AnswerCard } from "./AnswerCard";
 
 export function QueryPanel() {
   const [input, setInput] = useState("");
   const { results, isQuerying, error, runQuery } = useQuery();
+  const { documents } = useAppStore();
   const textareaRef = useRef<HTMLTextAreaElement>(null);
 
   const submit = async () => {
@@ -57,7 +59,7 @@ export function QueryPanel() {
         )}
 
         {results.map((r, i) => (
-          <AnswerCard key={r.span_hash} result={r} index={i} />
+          <AnswerCard key={r.span_hash} result={r} index={i} documents={documents} />
         ))}
       </div>
 

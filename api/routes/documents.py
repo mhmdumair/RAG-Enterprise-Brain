@@ -69,8 +69,16 @@ async def delete_document(
 ):
     from db.queries import delete_chunks_by_document
     from motor.motor_asyncio import AsyncIOMotorDatabase
+    from pathlib import Path
+    from core.config import settings
+    
     await delete_chunks_by_document(db, document_id)
     await db["documents"].delete_one({"_id": document_id})
+    
+    # Delete the file
+    file_path = Path(settings.upload_dir) / f"{document_id}.pdf"
+    if file_path.exists():
+        file_path.unlink()
 
 @router.get(
     "/documents/{document_id}/file",
@@ -94,7 +102,7 @@ async def get_document_file(
     if not doc:
         raise HTTPException(status_code=404, detail="Document not found")
     
-    file_path = Path(settings.upload_dir) / f"{document_id}.pdf"
+    file_path = Path(settings.upload_dir) / doc["filename"]
     if not file_path.exists():
         raise HTTPException(status_code=404, detail="File not found")
     

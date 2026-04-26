@@ -1,21 +1,21 @@
 "use client";
 
-import { Answer } from "@/lib/types";
+import { Answer, Document } from "@/lib/types";
 import { useAppStore } from "@/store/appStore";
 import { formatScore } from "@/lib/utils";
 
 interface Props {
   result: Answer;
   index: number;
+  documents: Document[];
 }
 
-export function AnswerCard({ result, index }: Props) {
-  const { activeAnswer, setActiveAnswer, setActivePage } = useAppStore();
+export function AnswerCard({ result, index, documents }: Props) {
+  const { activeAnswer, openAnswer } = useAppStore();
   const isActive = activeAnswer?.span_hash === result.span_hash;
 
   const handleClick = () => {
-    setActiveAnswer(result);
-    setActivePage(result.page_number);
+    openAnswer(result, documents);
   };
 
   const confidenceColor =
@@ -29,7 +29,7 @@ export function AnswerCard({ result, index }: Props) {
     <div
       onClick={handleClick}
       className={`
-        rounded border px-4 py-3 cursor-pointer text-xs transition-all duration-150
+        min-w-0 rounded border px-4 py-3 cursor-pointer text-xs transition-all duration-150
         ${isActive
           ? "border-[#4f8ef7] bg-[#0d1525]"
           : "border-[#1e2230] bg-[#12141a] hover:border-[#2a3050]"
@@ -47,7 +47,7 @@ export function AnswerCard({ result, index }: Props) {
       </div>
 
       {/* Answer span */}
-      <p className="text-[#c8d8f0] leading-relaxed mb-2">
+      <p className="text-[#c8d8f0] leading-relaxed mb-2 wrap-break-word">
         &ldquo;{result.text}&rdquo;
       </p>
 

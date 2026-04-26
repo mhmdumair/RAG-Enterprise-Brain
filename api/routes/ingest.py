@@ -22,6 +22,7 @@ from motor.motor_asyncio import AsyncIOMotorDatabase
 from core.config import settings
 from core.logger import get_logger
 from core.exceptions import FileTooLargeError, TooManyPDFsError, PDFParseError
+from core.utils import make_document_id
 from brain.pipeline import IngestionPipeline
 from api.schemas import IngestResponse, ErrorResponse
 from api.dependencies import get_db, get_pipeline
@@ -62,10 +63,13 @@ async def ingest_document(
             ).model_dump(),
         )
     
+    document_id = make_document_id(filename)
+    
     logger.info(
         "Ingest request received",
         extra={
             "pdf_filename": filename,  # Changed from 'filename' to avoid KeyError
+            "document_id": document_id,
             "content_type": file.content_type,
         }
     )
@@ -80,7 +84,7 @@ async def ingest_document(
     # ── Save to disk ──────────────────────────────────────────────────────────
     upload_dir = Path(settings.upload_dir)
     upload_dir.mkdir(parents=True, exist_ok=True)
-    upload_path = upload_dir / filename
+    upload_path = upload_dir / f"{document_id}.pdf"
     
     try:
         with open(upload_path, "wb") as f:

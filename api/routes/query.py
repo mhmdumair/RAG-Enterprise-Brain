@@ -65,13 +65,15 @@ async def run_query(
     try:
         result = await dispatcher.dispatch(request.query)
     except NoAnswerFoundError as exc:
-        return JSONResponse(
-            status_code=404,
-            content=ErrorResponse(
-                error="NoAnswerFoundError",
-                message=exc.message,
-                details=exc.details,
-            ).model_dump(),
+        # Return 200 with empty answers instead of 404
+        elapsed_ms = (time.perf_counter() - start_time) * 1000
+        return QueryResponse(
+            query=request.query,
+            answers=[],
+            total_answers=0,
+            total_chunks_searched=0,
+            rake_used=False,
+            processing_ms=round(elapsed_ms, 2),
         )
 
     elapsed_ms = (time.perf_counter() - start_time) * 1000
