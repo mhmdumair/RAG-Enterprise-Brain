@@ -84,7 +84,8 @@ async def ingest_document(
     # ── Save to disk ──────────────────────────────────────────────────────────
     upload_dir = Path(settings.upload_dir)
     upload_dir.mkdir(parents=True, exist_ok=True)
-    upload_path = upload_dir / f"{document_id}.pdf"
+    # Save with original filename, not hash-based ID
+    upload_path = upload_dir / filename
     
     try:
         with open(upload_path, "wb") as f:
@@ -112,25 +113,10 @@ async def ingest_document(
     try:
         result = await pipeline.run(upload_path)
     except Exception as exc:
-        # Clean up temp file if pipeline fails
+        # Clean up file if pipeline fails
         if upload_path.exists():
             upload_path.unlink()
         raise
-    
-    # Move file to permanent storage after successful ingestion
-    permanent_path = Path(settings.upload_dir) / f"{result.document_id}.pdf"
-    try:
-        upload_path.rename(permanent_path)
-        logger.info(
-            "File moved to permanent storage",
-            extra={"pdf_filename": filename, "document_id": result.document_id, "path": str(permanent_path)}
-        )
-    except Exception as exc:
-        logger.error(
-            "Failed to move file to permanent storage",
-            extra={"pdf_filename": filename, "error": str(exc)}
-        )
-        # Don't raise, ingestion succeeded
 
     logger.info(
         "Ingest completed successfully",

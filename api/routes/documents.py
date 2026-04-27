@@ -72,13 +72,24 @@ async def delete_document(
     from pathlib import Path
     from core.config import settings
     
+    # Get document to retrieve original filename
+    doc = await db["documents"].find_one({"_id": document_id})
+    
+    # Delete chunks
     await delete_chunks_by_document(db, document_id)
+    
+    # Delete document record
     await db["documents"].delete_one({"_id": document_id})
     
-    # Delete the file
-    file_path = Path(settings.upload_dir) / f"{document_id}.pdf"
-    if file_path.exists():
-        file_path.unlink()
+    # Delete the file using original filename from MongoDB
+    if doc and "filename" in doc:
+        file_path = Path(settings.upload_dir) / doc["filename"]
+        if file_path.exists():
+            file_path.unlink()
+            logger.info(
+                "Document file deleted",
+                extra={"document_id": document_id, "filename": doc["filename"]}
+            )
 
 @router.get(
     "/documents/{document_id}/file",
@@ -92,22 +103,55 @@ async def get_document_file(
 ):
     """
     Return the original PDF file for the given document ID.
+    Handles both new (original filename) and old (hash-based) storage formats.
     """
     from pathlib import Path
     from fastapi.responses import FileResponse
     from core.config import settings
     
-    # Check if document exists
+    # Check if document exists in MongoDB
     doc = await db["documents"].find_one({"_id": document_id})
     if not doc:
         raise HTTPException(status_code=404, detail="Document not found")
     
-    file_path = Path(settings.upload_dir) / doc["filename"]
+    # Use the original filename stored in MongoDB
+    original_filename = doc.get("filename")
+    if not original_filename:
+        raise HTTPException(status_code=500, detail="Filename not found in database record")
+    
+    file_path = Path(settings.upload_dir) / original_filename
+    
+    # Backward compatibility: if file doesn't exist, try hash-based name
     if not file_path.exists():
-        raise HTTPException(status_code=404, detail="File not found")
+        hash_based_filename = f"{document_id}.pdf"
+        hash_based_path = Path(settings.upload_dir) / hash_based_filename
+        if hash_based_path.exists():
+            logger.info(
+                "Found file with hash-based name (legacy), migrating to original filename",
+                extra={"document_id": document_id, "legacy_name": hash_based_filename}
+            )
+            # Migrate: rename old hash-based file to original filename
+            try:
+                hash_based_path.rename(file_path)
+            except Exception as exc:
+                logger.warning(
+                    "Failed to migrate file to original filename",
+                    extra={"document_id": document_id, "error": str(exc)}
+                )
+                # Use the hash-based file anyway
+                file_path = hash_based_path
+        else:
+            logger.error(
+                "PDF file not found",
+                extra={"document_id": document_id, "filename": original_filename, "path": str(file_path)}
+            )
+            raise HTTPException(status_code=404, detail="PDF file not found on disk")
+    
+    if not file_path.exists():
+        raise HTTPException(status_code=404, detail="PDF file not found on disk")
     
     return FileResponse(
         path=file_path,
         media_type="application/pdf",
-        filename=doc["filename"],
+        filename=original_filename,
     )
