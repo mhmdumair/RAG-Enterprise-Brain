@@ -3,17 +3,13 @@ api/routes/query.py
 ===================
 POST /query — run an audit question against ingested documents.
 
-Flow:
-    1. Validate QueryRequest (query string, top_k)
-    2. Run AuditDispatcher.dispatch()
-    3. Build QueryResponse with verified VerifiedAnswer spans
-    4. Return with processing time
-
-Returns 404 if no verified answer found (NoAnswerFoundError).
+Change from previous version:
+    QueryResponse now includes reranked field from DispatchResult.
 """
 
 import time
 from fastapi import APIRouter, Depends
+from fastapi.responses import JSONResponse
 
 from core.logger import get_logger
 from core.exceptions import NoAnswerFoundError
@@ -26,7 +22,6 @@ from api.schemas import (
     ErrorResponse,
 )
 from api.dependencies import get_dispatcher
-from fastapi.responses import JSONResponse
 
 logger = get_logger(__name__)
 router = APIRouter()
@@ -43,7 +38,7 @@ router = APIRouter()
     },
 )
 async def run_query(
-    request: QueryRequest,
+    request:    QueryRequest,
     dispatcher: AuditDispatcher = Depends(get_dispatcher),
 ):
     """
@@ -52,28 +47,32 @@ async def run_query(
     Returns ranked verified answer spans, each attributed to its
     source document, page number, and exact bounding box coordinates.
 
-    If no answer passes the confidence threshold (τ_ans), returns 404.
+    The reranked field indicates whether Cross-Encoder re-ranking
+    was applied to improve answer quality.
+
+    Returns 404 if no answer passes the confidence threshold.
     """
     start_time = time.perf_counter()
 
     logger.info(
         "Query received",
-        extra={"query": request.query[:80], "top_k": request.top_k},
+        extra={
+            "query":  request.query[:80],
+            "top_k":  request.top_k,
+        },
     )
 
     # ── Run dispatch ──────────────────────────────────────────────────────────
     try:
         result = await dispatcher.dispatch(request.query)
     except NoAnswerFoundError as exc:
-        # Return 200 with empty answers instead of 404
-        elapsed_ms = (time.perf_counter() - start_time) * 1000
-        return QueryResponse(
-            query=request.query,
-            answers=[],
-            total_answers=0,
-            total_chunks_searched=0,
-            rake_used=False,
-            processing_ms=round(elapsed_ms, 2),
+        return JSONResponse(
+            status_code=404,
+            content=ErrorResponse(
+                error="NoAnswerFoundError",
+                message=exc.message,
+                details=exc.details,
+            ).model_dump(),
         )
 
     elapsed_ms = (time.perf_counter() - start_time) * 1000
@@ -84,6 +83,7 @@ async def run_query(
             text=ans.text,
             span_score=ans.span_score,
             null_score=ans.null_score,
+            rerank_score=ans.rerank_score,
             filename=ans.filename,
             page_number=ans.page_number,
             bbox=BBoxSchema(**ans.bbox),
@@ -97,9 +97,10 @@ async def run_query(
     logger.info(
         "Query complete",
         extra={
-            "query": request.query[:80],
-            "answers": len(answers),
-            "ms": round(elapsed_ms, 1),
+            "query":    request.query[:80],
+            "answers":  len(answers),
+            "reranked": result.reranked,
+            "ms":       round(elapsed_ms, 1),
         },
     )
 
@@ -109,5 +110,6 @@ async def run_query(
         total_answers=len(answers),
         total_chunks_searched=result.total_chunks_searched,
         rake_used=result.rake_used,
+        reranked=result.reranked,
         processing_ms=round(elapsed_ms, 2),
     )

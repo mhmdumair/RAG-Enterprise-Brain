@@ -3,15 +3,12 @@ auditor/retriever.py
 ====================
 ANN retrieval — embed query → FAISS search → MongoDB chunk lookup.
 
-This is the first stage of the auditor pipeline.
-It bridges Boundary 1 (FAISS + MongoDB) and Boundary 2 (QA).
-
-Flow:
-    query string
-      └─ Embedder.embed_query()          → query vector (384,)
-      └─ FAISSIndex.search()             → top-K vector_ids + distances
-      └─ get_chunks_by_vector_ids()      → chunk metadata from MongoDB
-      └─ list[RetrievedChunk]            → passed to worker/dispatcher
+Change from previous version:
+    - RetrievedChunk gains an optional rerank_score field (default 0.0)
+      set by CrossEncoderReranker after scoring.
+    - Default k changed to settings.retrieval_top_k (20) so FAISS
+      fetches the wider candidate pool for re-ranking.
+    - All other logic is identical.
 """
 
 from dataclasses import dataclass, field
@@ -22,7 +19,7 @@ from core.logger import get_logger
 from core.exceptions import RetrievalError
 from brain.embedder import Embedder
 from brain.indexer import FAISSIndex
-from db.queries import get_chunks_by_vector_ids, get_chunks_by_document_and_range
+from db.queries import get_chunks_by_vector_ids
 
 logger = get_logger(__name__)
 
@@ -43,20 +40,18 @@ class RetrievedChunk:
         page_number  — source page (1-based)
         text         — chunk text (used as QA context)
         bbox         — normalized BBox for frontend highlighting
-        chunk_index  — position in document (for context stitching)
-        stitched_text — context-stitched version (if enabled)
+        rerank_score — Cross-Encoder relevance score (set after re-ranking)
+                       0.0 if re-ranking was not applied
     """
-    vector_id: int
-    distance: float
-    chunk_id: str
-    document_id: str
-    filename: str
-    page_number: int
-    text: str
-    bbox: dict
-    chunk_index: int = 0
-    stitched_text: str = field(default="")
-    stitched_chunks_count: int = 1
+    vector_id:    int
+    distance:     float
+    chunk_id:     str
+    document_id:  str
+    filename:     str
+    page_number:  int
+    text:         str
+    bbox:         dict
+    rerank_score: float = field(default=0.0)
 
 
 # ── Retriever ─────────────────────────────────────────────────────────────────
@@ -65,6 +60,9 @@ class Retriever:
     """
     Retrieves the top-K most relevant chunks for a query.
 
+    Default k is now settings.retrieval_top_k (20) to feed the
+    Cross-Encoder a wider candidate pool.
+
     Usage:
         retriever = Retriever(embedder, faiss_index, db)
         chunks = await retriever.retrieve("What is the warranty period?")
@@ -72,40 +70,44 @@ class Retriever:
 
     def __init__(
         self,
-        embedder: Embedder,
+        embedder:    Embedder,
         faiss_index: FAISSIndex,
-        db: AsyncIOMotorDatabase,
+        db:          AsyncIOMotorDatabase,
     ):
-        self._embedder = embedder
-        self._faiss = faiss_index
-        self._db = db
+        self._embedder    = embedder
+        self._faiss       = faiss_index
+        self._db          = db
 
     async def retrieve(
         self,
         query: str,
-        k: int | None = None,
-        stitch_context: bool = True,
-        window_size: int = 1,
+        k:     int | None = None,
     ) -> list[RetrievedChunk]:
         """
         Embed query and return top-K enriched chunks.
 
+        Default k is settings.retrieval_top_k (20) — the wider pool
+        feeds the Cross-Encoder re-ranker. The re-ranker then selects
+        the best settings.top_k_chunks (5) for RoBERTa QA.
+
         Args:
             query — the audit question string
-            k     — override top-K (defaults to settings.top_k_chunks)
-            stitch_context — if True, fetch neighboring chunks for context
-            window_size — number of neighbor chunks to fetch on each side
+            k     — override candidate count (defaults to retrieval_top_k)
 
         Returns:
-            list[RetrievedChunk] ordered by relevance (closest first)
+            list[RetrievedChunk] ordered by FAISS distance ascending.
+            Order will be updated by rerank_score after re-ranking.
 
         Raises:
             RetrievalError — if embedding or FAISS search fails
         """
-        k = k or settings.top_k_chunks
+        # Use retrieval_top_k (20) as default — wider pool for re-ranker
+        k = k or settings.retrieval_top_k
 
         if not self._faiss.is_ready:
-            raise RetrievalError("FAISS index is empty. Ingest documents first.")
+            raise RetrievalError(
+                "FAISS index is empty. Ingest documents first."
+            )
 
         # ── Step 1: Embed query ───────────────────────────────────────────────
         try:
@@ -120,7 +122,10 @@ class Retriever:
             raise RetrievalError(f"FAISS search failed: {exc}") from exc
 
         if not vector_ids:
-            logger.warning("FAISS returned no results", extra={"query": query})
+            logger.warning(
+                "FAISS returned no results",
+                extra={"query": query[:60]},
+            )
             return []
 
         # ── Step 3: MongoDB chunk lookup ──────────────────────────────────────
@@ -129,7 +134,7 @@ class Retriever:
         except Exception as exc:
             raise RetrievalError(f"MongoDB lookup failed: {exc}") from exc
 
-        # Build a distance map for ordering (FAISS order may differ from Mongo)
+        # Distance map for ordering (MongoDB order may differ from FAISS)
         distance_map = dict(zip(vector_ids, distances))
 
         # ── Step 4: Build RetrievedChunk objects ──────────────────────────────
@@ -145,87 +150,20 @@ class Retriever:
                 page_number=raw.get("page_number", 0),
                 text=raw.get("text", ""),
                 bbox=raw.get("bbox", {}),
-                chunk_index=raw.get("chunk_index", 0),
+                rerank_score=0.0,  # populated by CrossEncoderReranker
             ))
 
-        # Sort by distance ascending (most relevant first)
+        # Sort by FAISS distance ascending (most relevant first)
+        # This order is replaced by rerank_score after re-ranking
         retrieved.sort(key=lambda c: c.distance)
-
-        # ── Step 5: Context Stitching (The key improvement!) ──────────────────
-        if stitch_context:
-            retrieved = await self._stitch_context(retrieved, window_size)
 
         logger.info(
             "Retrieval complete",
             extra={
-                "query": query[:60],
-                "k": k,
+                "query":     query[:60],
+                "k":         k,
                 "retrieved": len(retrieved),
-                "stitched": stitch_context,
             },
         )
 
         return retrieved
-
-    async def _stitch_context(
-        self, 
-        chunks: list[RetrievedChunk], 
-        window_size: int = 1
-    ) -> list[RetrievedChunk]:
-        """
-        Stitch neighboring chunks to provide broader context.
-        
-        For each retrieved chunk, fetches window_size chunks before and after
-        to create a super-chunk that bridges the context gap.
-        This allows the QA model to see both the question setup and answer.
-        """
-        if not chunks:
-            return chunks
-
-        stitched_chunks = []
-        
-        for chunk in chunks:
-            try:
-                # Fetch neighboring chunks from the same document
-                neighbors = await get_chunks_by_document_and_range(
-                    self._db,
-                    document_id=chunk.document_id,
-                    start_index=max(0, chunk.chunk_index - window_size),
-                    end_index=chunk.chunk_index + window_size + 1,
-                )
-                
-                if neighbors and len(neighbors) > 1:
-                    # Sort by chunk_index to maintain document order
-                    neighbors.sort(key=lambda x: x.get("chunk_index", 0))
-                    
-                    # Stitch texts together in order
-                    stitched_text = " ".join([n.get("text", "") for n in neighbors])
-                    
-                    # Store stitched version
-                    chunk.stitched_text = stitched_text
-                    chunk.stitched_chunks_count = len(neighbors)
-                    
-                    logger.debug(
-                        "Stitched context",
-                        extra={
-                            "chunk_id": chunk.chunk_id,
-                            "original_index": chunk.chunk_index,
-                            "neighbors": len(neighbors),
-                            "original_length": len(chunk.text),
-                            "stitched_length": len(stitched_text),
-                        }
-                    )
-                else:
-                    chunk.stitched_text = chunk.text
-                    chunk.stitched_chunks_count = 1
-                    
-            except Exception as exc:
-                logger.warning(
-                    f"Failed to stitch context for chunk {chunk.chunk_id}: {exc}"
-                )
-                chunk.stitched_text = chunk.text
-                chunk.stitched_chunks_count = 1
-            
-            stitched_chunks.append(chunk)
-        
-        return stitched_chunks
