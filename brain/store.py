@@ -3,18 +3,8 @@ brain/store.py
 ==============
 MongoDB persistence for chunk metadata.
 
-After FAISS assigns integer vector IDs to each chunk,
-this module saves the mapping:
-    vector_id (int) → filename, page_number, bbox, text, document_id
-
-This bridge is what makes results attributable to a source document.
-
-Changes from previous version:
-    ChunkRecord construction now passes is_fragment and sentence_count.
-    All method signatures are identical — nothing outside this file changes.
-
-Flow:
-    list[TextChunk] + list[vector_id] → ChunkRecord → MongoDB chunks collection
+Changes:
+    ChunkRecord now includes next_chunk_id, prev_chunk_id, is_linked.
 """
 
 from motor.motor_asyncio import AsyncIOMotorDatabase
@@ -36,13 +26,6 @@ logger = get_logger(__name__)
 class ChunkStore:
     """
     Saves ingestion results (document record + chunk records) to MongoDB.
-
-    Public interface is identical to the previous version.
-    brain/pipeline.py calls this and is unaffected.
-
-    Usage:
-        store = ChunkStore(db)
-        await store.save(parsed_doc, chunks, vector_ids)
     """
 
     def __init__(self, db: AsyncIOMotorDatabase):
@@ -56,21 +39,6 @@ class ChunkStore:
     ) -> None:
         """
         Persist the document record and all chunk records to MongoDB.
-
-        Steps:
-            1. Delete existing chunks if document was previously ingested
-            2. Insert / upsert the DocumentRecord
-            3. Bulk insert all ChunkRecords with their vector_ids
-
-        Args:
-            parsed_doc  — output of PDFParser (filename, doc_id, pages)
-            chunks      — output of TextChunker (text, bbox, page_number,
-                          is_fragment, sentence_count)
-            vector_ids  — output of FAISSIndex.add() — same length as chunks
-
-        Raises:
-            ValueError    — if chunks and vector_ids lengths do not match
-            DatabaseError — if any MongoDB operation fails
         """
         if len(chunks) != len(vector_ids):
             raise ValueError(
@@ -82,13 +50,14 @@ class ChunkStore:
             "Saving ingestion to MongoDB",
             extra={
                 "document_id": parsed_doc.document_id,
-                "doc_file":    parsed_doc.filename,   # ← renamed from "filename"
+                "doc_file":    parsed_doc.filename,
                 "chunks":      len(chunks),
                 "fragments":   sum(1 for c in chunks if c.is_fragment),
+                "linked":      sum(1 for c in chunks if c.is_linked),
             },
         )
 
-        # ── Step 1: Remove old chunks for this document (re-ingestion) ────
+        # ── Step 1: Remove old chunks for this document ────────────────────
         deleted = await delete_chunks_by_document(
             self._db,
             parsed_doc.document_id,
@@ -113,7 +82,7 @@ class ChunkStore:
         )
         await insert_document(self._db, doc_record)
 
-        # ── Step 3: Build and bulk insert chunk records ───────────────────
+        # ── Step 3: Build and bulk insert chunk records with link fields ───
         chunk_records = [
             ChunkRecord(
                 chunk_id=chunk.chunk_id,
@@ -124,8 +93,11 @@ class ChunkStore:
                 chunk_index=chunk.chunk_index,
                 text=chunk.text,
                 bbox=chunk.bbox,
-                is_fragment=chunk.is_fragment,        # ← new field
-                sentence_count=chunk.sentence_count,  # ← new field
+                is_fragment=chunk.is_fragment,
+                sentence_count=chunk.sentence_count,
+                next_chunk_id=chunk.next_chunk_id,
+                prev_chunk_id=chunk.prev_chunk_id,
+                is_linked=chunk.is_linked,
             )
             for chunk, vector_id in zip(chunks, vector_ids)
         ]

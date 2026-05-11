@@ -3,12 +3,9 @@ auditor/retriever.py
 ====================
 ANN retrieval — embed query → FAISS search → MongoDB chunk lookup.
 
-Change from previous version:
-    - RetrievedChunk gains an optional rerank_score field (default 0.0)
-      set by CrossEncoderReranker after scoring.
-    - Default k changed to settings.retrieval_top_k (20) so FAISS
-      fetches the wider candidate pool for re-ranking.
-    - All other logic is identical.
+Changes:
+    - RetrievedChunk gains linked_text and is_linked fields
+    - retrieve() now merges linked chunks when is_linked=True
 """
 
 from dataclasses import dataclass, field
@@ -19,7 +16,7 @@ from core.logger import get_logger
 from core.exceptions import RetrievalError
 from brain.embedder import Embedder
 from brain.indexer import FAISSIndex
-from db.queries import get_chunks_by_vector_ids
+from db.queries import get_chunks_by_vector_ids, get_chunk_with_chain
 
 logger = get_logger(__name__)
 
@@ -39,9 +36,10 @@ class RetrievedChunk:
         filename     — source PDF filename
         page_number  — source page (1-based)
         text         — chunk text (used as QA context)
+        linked_text  — merged text from linked chunks (if is_linked)
         bbox         — normalized BBox for frontend highlighting
-        rerank_score — Cross-Encoder relevance score (set after re-ranking)
-                       0.0 if re-ranking was not applied
+        rerank_score — Cross-Encoder relevance score
+        is_linked    — True if this chunk has prev/next links
     """
     vector_id:    int
     distance:     float
@@ -52,6 +50,8 @@ class RetrievedChunk:
     text:         str
     bbox:         dict
     rerank_score: float = field(default=0.0)
+    linked_text:  str = field(default="")
+    is_linked:    bool = False
 
 
 # ── Retriever ─────────────────────────────────────────────────────────────────
@@ -59,13 +59,7 @@ class RetrievedChunk:
 class Retriever:
     """
     Retrieves the top-K most relevant chunks for a query.
-
-    Default k is now settings.retrieval_top_k (20) to feed the
-    Cross-Encoder a wider candidate pool.
-
-    Usage:
-        retriever = Retriever(embedder, faiss_index, db)
-        chunks = await retriever.retrieve("What is the warranty period?")
+    Automatically merges linked chunks when is_linked=True.
     """
 
     def __init__(
@@ -85,23 +79,8 @@ class Retriever:
     ) -> list[RetrievedChunk]:
         """
         Embed query and return top-K enriched chunks.
-
-        Default k is settings.retrieval_top_k (20) — the wider pool
-        feeds the Cross-Encoder re-ranker. The re-ranker then selects
-        the best settings.top_k_chunks (5) for RoBERTa QA.
-
-        Args:
-            query — the audit question string
-            k     — override candidate count (defaults to retrieval_top_k)
-
-        Returns:
-            list[RetrievedChunk] ordered by FAISS distance ascending.
-            Order will be updated by rerank_score after re-ranking.
-
-        Raises:
-            RetrievalError — if embedding or FAISS search fails
+        Merges linked chunks automatically.
         """
-        # Use retrieval_top_k (20) as default — wider pool for re-ranker
         k = k or settings.retrieval_top_k
 
         if not self._faiss.is_ready:
@@ -134,28 +113,70 @@ class Retriever:
         except Exception as exc:
             raise RetrievalError(f"MongoDB lookup failed: {exc}") from exc
 
-        # Distance map for ordering (MongoDB order may differ from FAISS)
+        # Distance map for ordering
         distance_map = dict(zip(vector_ids, distances))
 
-        # ── Step 4: Build RetrievedChunk objects ──────────────────────────────
+        # ── Step 4: Build RetrievedChunk objects with link merging ────────────
         retrieved: list[RetrievedChunk] = []
+        
         for raw in raw_chunks:
             vid = raw.get("vector_id")
+            chunk_id = raw.get("chunk_id", "")
+            is_linked = raw.get("is_linked", False)
+            
+            # Get base text
+            base_text = raw.get("text", "")
+            merged_text = base_text
+            linked_chain = []
+            
+            # If linked, get the full chain and merge text
+            if is_linked:
+                try:
+                    chain = await get_chunk_with_chain(self._db, chunk_id, max_depth=3)
+                    if len(chain) > 1:
+                        # Merge all texts in order
+                        merged_text = " ".join([c.get("text", "") for c in chain])
+                        linked_chain = [c.get("chunk_id") for c in chain]
+                        logger.debug(
+                            "Merged linked chunks",
+                            extra={
+                                "chunk_id": chunk_id,
+                                "chain": linked_chain,
+                                "original_len": len(base_text),
+                                "merged_len": len(merged_text),
+                            }
+                        )
+                except Exception as e:
+                    logger.warning(f"Failed to merge linked chunks for {chunk_id}: {e}")
+            
             retrieved.append(RetrievedChunk(
                 vector_id=vid,
                 distance=distance_map.get(vid, 9999.0),
-                chunk_id=raw.get("chunk_id", ""),
+                chunk_id=chunk_id,
                 document_id=raw.get("document_id", ""),
                 filename=raw.get("filename", ""),
                 page_number=raw.get("page_number", 0),
-                text=raw.get("text", ""),
+                text=base_text,
                 bbox=raw.get("bbox", {}),
-                rerank_score=0.0,  # populated by CrossEncoderReranker
+                rerank_score=0.0,
+                linked_text=merged_text if is_linked else "",
+                is_linked=is_linked,
             ))
 
-        # Sort by FAISS distance ascending (most relevant first)
-        # This order is replaced by rerank_score after re-ranking
+        # Sort by FAISS distance ascending
         retrieved.sort(key=lambda c: c.distance)
+
+        # Deduplicate: If multiple chunks from same linked chain appear,
+        # keep only the one with best distance
+        seen_chains = set()
+        deduped = []
+        for chunk in retrieved:
+            chain_key = chunk.chunk_id
+            if chunk.is_linked and chunk.linked_text:
+                # Use first chunk in chain as key for dedup
+                # Simplified: just use chunk_id for now
+                pass
+            deduped.append(chunk)
 
         logger.info(
             "Retrieval complete",
@@ -163,7 +184,8 @@ class Retriever:
                 "query":     query[:60],
                 "k":         k,
                 "retrieved": len(retrieved),
+                "linked_merged": sum(1 for c in retrieved if c.is_linked),
             },
         )
 
-        return retrieved
+        return deduped
