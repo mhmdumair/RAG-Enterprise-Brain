@@ -21,7 +21,7 @@ class Settings(BaseSettings):
         env_file_encoding="utf-8",
         case_sensitive=False,
         extra="ignore",
-        protected_namespaces=("settings_",),  # ← fix: suppress model_ warning
+        protected_namespaces=("settings_",),
     )
 
     # ── MongoDB ───────────────────────────────────────────────────────────────
@@ -42,11 +42,15 @@ class Settings(BaseSettings):
 
     # ── Storage paths ─────────────────────────────────────────────────────────
     upload_dir: Path = Field(default=BASE_DIR / "storage" / "uploads")
-    faiss_index_path: Path = Field(default=BASE_DIR / "storage" / "indexes" / "brain.index")
+    faiss_index_path: Path = Field(
+        default=BASE_DIR / "storage" / "indexes" / "brain.index"
+    )
     model_cache_dir: Path = Field(default=BASE_DIR / "storage" / "models")
 
-    # ── Embedding model ───────────────────────────────────────────────────────
-    embedding_model_name: str = Field(default="sentence-transformers/all-MiniLM-L6-v2")
+    # ── Embedding model (Bi-Encoder) ──────────────────────────────────────────
+    embedding_model_name: str = Field(
+        default="sentence-transformers/all-MiniLM-L6-v2"
+    )
     embedding_dim: int = Field(default=384)
 
     # ── QA model ──────────────────────────────────────────────────────────────
@@ -56,7 +60,37 @@ class Settings(BaseSettings):
     qa_doc_stride: int = Field(default=128)
 
     # ── Retrieval ─────────────────────────────────────────────────────────────
-    top_k_chunks: int = Field(default=5)
+    # FAISS retrieves a wider candidate pool for the re-ranker to judge
+    retrieval_top_k: int = Field(
+        default=20,
+        description=(
+            "Number of candidate chunks fetched from FAISS. "
+            "Larger pool gives the Cross-Encoder more candidates to judge."
+        ),
+    )
+    # After re-ranking, only this many chunks reach RoBERTa QA
+    top_k_chunks: int = Field(
+        default=5,
+        description=(
+            "Number of chunks passed to RoBERTa after Cross-Encoder re-ranking."
+        ),
+    )
+
+    # ── Cross-Encoder Re-Ranker ───────────────────────────────────────────────
+    rerank_model_name: str = Field(
+        default="cross-encoder/ms-marco-MiniLM-L-6-v2",
+        description=(
+            "HuggingFace model ID for the Cross-Encoder re-ranker. "
+            "Scores (query, chunk) pairs for fine-grained relevance."
+        ),
+    )
+    rerank_enabled: bool = Field(
+        default=True,
+        description=(
+            "Set False to disable re-ranking and fall back to "
+            "raw FAISS ordering. Useful for debugging or low-resource environments."
+        ),
+    )
 
     # ── Abstention threshold ──────────────────────────────────────────────────
     tau_ans: float = Field(default=0.1)
@@ -90,6 +124,6 @@ class Settings(BaseSettings):
         self.model_cache_dir.mkdir(parents=True, exist_ok=True)
 
 
-# ── Singleton — import this everywhere ───────────────────────────────────────
+# ── Singleton ─────────────────────────────────────────────────────────────────
 settings = Settings()
 settings.ensure_dirs()

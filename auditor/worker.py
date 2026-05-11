@@ -8,14 +8,12 @@ Each worker:
     2. Runs QAModel.predict() to extract a span
     3. Returns a WorkerResult enriched with source metadata
 
-The dispatcher runs multiple workers concurrently using
-asyncio + ProcessPoolExecutor (CoW memory sharing).
-
-Note: QAModel inference is CPU-bound, so we offload it to
-a thread pool executor to avoid blocking the async event loop.
+The dispatcher runs multiple workers concurrently using asyncio.gather.
+CPU-bound QA inference is offloaded to a thread pool executor.
 """
 
 import asyncio
+import traceback
 from dataclasses import dataclass
 from concurrent.futures import ThreadPoolExecutor
 
@@ -35,15 +33,15 @@ class WorkerResult:
     Output of a single worker run.
 
     Fields:
-        qa_result    — QAResult from the model (has span, scores)
-        chunk        — the RetrievedChunk that was processed
-        success      — False if the worker threw an exception
-        error        — error message if success is False
+        qa_result — QAResult from the model (has span, scores)
+        chunk     — the RetrievedChunk that was processed
+        success   — False if the worker threw an exception
+        error     — error message if success is False
     """
     qa_result: QAResult | None
-    chunk: RetrievedChunk
-    success: bool
-    error: str = ""
+    chunk:     RetrievedChunk
+    success:   bool
+    error:     str = ""
 
 
 # ── Worker ────────────────────────────────────────────────────────────────────
@@ -60,16 +58,24 @@ class QAWorker:
         result = await worker.run(question, chunk)
     """
 
-    def __init__(self, qa_model: QAModel, executor: ThreadPoolExecutor | None = None):
-        self._model = qa_model
-        self._executor = executor  # shared thread pool from dispatcher
+    def __init__(
+        self,
+        qa_model:  QAModel,
+        executor:  ThreadPoolExecutor | None = None,
+    ):
+        self._model    = qa_model
+        self._executor = executor
 
-    async def run(self, question: str, chunk: RetrievedChunk) -> WorkerResult:
+    async def run(
+        self,
+        question: str,
+        chunk:    RetrievedChunk,
+    ) -> WorkerResult:
         """
         Run QA inference on one chunk asynchronously.
 
         Offloads CPU-bound model inference to a thread pool executor
-        so it doesn't block the asyncio event loop.
+        so it does not block the asyncio event loop.
 
         Args:
             question — the audit query string
@@ -81,27 +87,28 @@ class QAWorker:
         loop = asyncio.get_event_loop()
 
         try:
-            # Use stitched text if available (from context stitching)
-            context = chunk.stitched_text if chunk.stitched_text else chunk.text
-            
             logger.debug(
                 "Worker running",
                 extra={
-                    "filename": chunk.filename,
-                    "page": chunk.page_number,
-                    "chunk_id": chunk.chunk_id,
-                    "context_length": len(context),
-                    "stitched": bool(chunk.stitched_text),
-                    "stitched_chunks": chunk.stitched_chunks_count,
+                    "doc_file":   chunk.filename,
+                    "page":       chunk.page_number,
+                    "chunk_id":   chunk.chunk_id,
+                    "text_len":   len(chunk.text),
                 },
             )
 
-            # Run CPU-bound inference in thread pool with stitched context
+            # Validate chunk text before sending to model
+            if not chunk.text or not chunk.text.strip():
+                raise ValueError(
+                    f"Chunk {chunk.chunk_id} has empty text — skipping."
+                )
+
+            # Run CPU-bound inference in thread pool
             qa_result = await loop.run_in_executor(
                 self._executor,
                 self._model.predict,
                 question,
-                context,  # Use stitched context!
+                chunk.text,
             )
 
             return WorkerResult(
@@ -112,10 +119,10 @@ class QAWorker:
 
         except QAModelError as exc:
             logger.warning(
-                "Worker QA failed",
+                "Worker QA model error",
                 extra={
                     "chunk_id": chunk.chunk_id,
-                    "error": str(exc),
+                    "error":    str(exc),
                 },
             )
             return WorkerResult(
@@ -126,13 +133,22 @@ class QAWorker:
             )
 
         except Exception as exc:
+            # Log full traceback so we can see the real error
+            tb = traceback.format_exc()
             logger.error(
                 "Worker unexpected error",
-                extra={"chunk_id": chunk.chunk_id, "error": str(exc)},
+                extra={
+                    "chunk_id":  chunk.chunk_id,
+                    "doc_file":  chunk.filename,
+                    "page":      chunk.page_number,
+                    "error":     str(exc),
+                    "type":      type(exc).__name__,
+                    "traceback": tb,
+                },
             )
             return WorkerResult(
                 qa_result=None,
                 chunk=chunk,
                 success=False,
-                error=str(exc),
+                error=f"{type(exc).__name__}: {exc}",
             )

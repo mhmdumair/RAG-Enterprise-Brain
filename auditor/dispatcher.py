@@ -3,31 +3,37 @@ auditor/dispatcher.py
 =====================
 Parallel QA dispatcher — Boundary 2 entry point.
 
-Orchestrates the full audit query flow:
-    1. Retrieve top-K chunks via ANN search
-    2. Run QA concurrently on all chunks (asyncio.gather + thread pool)
-    3. Apply abstention filter (S_span > S_null + τ_ans)
-    4. If all fail → trigger RAKE fallback → retry retrieval once
-    5. Deduplicate spans (SHA-256)
-    6. Return ranked, attributed VerifiedAnswer list
+Change from previous version:
+    CrossEncoderReranker inserted between retrieval and QA.
 
-This is the single function the API route calls.
+    Updated flow:
+        1. Retrieve Top 20 chunks via ANN search (FAISS)
+        2. Cross-Encoder scores each (query, chunk) pair
+        3. Re-ranked Top 5 passed to parallel QA workers
+        4. Abstention filter (S_span > S_null + τ_ans)
+        5. RAKE fallback if all spans rejected
+        6. Deduplication
+        7. Return VerifiedAnswer list
+
+    If rerank_enabled=False in config, step 2-3 are skipped
+    and raw FAISS Top 5 is used instead (fallback/debug mode).
 """
 
+import asyncio
 from dataclasses import dataclass
 from concurrent.futures import ThreadPoolExecutor
-import re
 
 from motor.motor_asyncio import AsyncIOMotorDatabase
-import asyncio
 
 from core.config import settings
 from core.logger import get_logger
 from core.exceptions import NoAnswerFoundError
+from core.utils import normalize_span, sha256_hash
 from brain.embedder import Embedder
 from brain.indexer import FAISSIndex
 from auditor.retriever import Retriever, RetrievedChunk
-from auditor.qa_model import QAModel, QAResult
+from auditor.reranker import CrossEncoderReranker
+from auditor.qa_model import QAModel
 from auditor.abstention import AbstentionFilter
 from auditor.rake_fallback import RAKEFallback
 from auditor.deduplicator import Deduplicator
@@ -45,25 +51,27 @@ class VerifiedAnswer:
     This is what the API returns to the frontend.
 
     Fields:
-        text         — the extracted answer string
-        span_score   — confidence score (higher = more confident)
-        null_score   — no-answer score (for reference)
-        filename     — source PDF filename
-        page_number  — source page (1-based)
-        bbox         — normalized BBox for frontend highlighting
-        chunk_text   — full chunk context (for display)
-        span_hash    — SHA-256 of normalized answer (dedup fingerprint)
-        rake_used    — True if this answer came from RAKE fallback retry
+        text                — the extracted answer string
+        span_score          — RoBERTa confidence score
+        null_score          — RoBERTa no-answer score
+        rerank_score        — Cross-Encoder relevance score for source chunk
+        filename            — source PDF filename
+        page_number         — source page (1-based)
+        bbox                — normalized BBox for frontend highlighting
+        chunk_text          — full chunk context
+        span_hash           — SHA-256 of normalized answer
+        rake_used           — True if RAKE fallback triggered
     """
-    text: str
-    span_score: float
-    null_score: float
-    filename: str
-    page_number: int
-    bbox: dict
-    chunk_text: str
-    span_hash: str
-    rake_used: bool = False
+    text:         str
+    span_score:   float
+    null_score:   float
+    rerank_score: float
+    filename:     str
+    page_number:  int
+    bbox:         dict
+    chunk_text:   str
+    span_hash:    str
+    rake_used:    bool = False
 
 
 @dataclass
@@ -72,26 +80,27 @@ class DispatchResult:
     Full result returned by the dispatcher.
 
     Fields:
-        answers              — ranked list of VerifiedAnswer
-        query                — original query string
-        rake_used            — True if RAKE fallback was triggered
-        total_chunks_searched— how many chunks were evaluated
+        answers               — ranked list of VerifiedAnswer
+        query                 — original query string
+        rake_used             — True if RAKE fallback was triggered
+        total_chunks_searched — how many chunks were evaluated by QA
+        reranked              — True if Cross-Encoder re-ranking was applied
     """
-    answers: list[VerifiedAnswer]
-    query: str
-    rake_used: bool
+    answers:               list[VerifiedAnswer]
+    query:                 str
+    rake_used:             bool
     total_chunks_searched: int
+    reranked:              bool
 
 
 # ── Dispatcher ────────────────────────────────────────────────────────────────
 
 class AuditDispatcher:
     """
-    Parallel audit dispatcher.
+    Parallel audit dispatcher with Cross-Encoder re-ranking.
 
-    Components are injected and shared across requests — the QA model
-    and embedder are expensive to reload. The thread pool is also
-    shared for efficient CPU utilization.
+    Components are injected and shared across requests.
+    The thread pool is shared for efficient CPU utilization.
 
     Usage:
         dispatcher = AuditDispatcher(embedder, faiss_index, db)
@@ -100,26 +109,151 @@ class AuditDispatcher:
 
     def __init__(
         self,
-        embedder: Embedder,
+        embedder:    Embedder,
         faiss_index: FAISSIndex,
-        db: AsyncIOMotorDatabase,
+        db:          AsyncIOMotorDatabase,
     ):
-        self._retriever = Retriever(embedder, faiss_index, db)
-        self._qa_model = QAModel()
-        self._abstention = AbstentionFilter()
-        self._rake = RAKEFallback()
+        self._retriever   = Retriever(embedder, faiss_index, db)
+        self._qa_model    = QAModel()
+        self._abstention  = AbstentionFilter()
+        self._rake        = RAKEFallback()
         self._deduplicator = Deduplicator()
 
-        # Shared thread pool — one thread per API worker
+        # Shared thread pool — CPU-bound inference runs here
         self._executor = ThreadPoolExecutor(max_workers=settings.api_workers)
-        self._worker = QAWorker(self._qa_model, self._executor)
+        self._worker   = QAWorker(self._qa_model, self._executor)
+
+        # Cross-Encoder re-ranker — loaded only if enabled
+        self._reranker: CrossEncoderReranker | None = None
+        if settings.rerank_enabled:
+            self._reranker = CrossEncoderReranker()
 
         logger.info(
             "AuditDispatcher initialized",
-            extra={"workers": settings.api_workers},
+            extra={
+                "workers":         settings.api_workers,
+                "rerank_enabled":  settings.rerank_enabled,
+                "retrieval_top_k": settings.retrieval_top_k,
+                "qa_top_k":        settings.top_k_chunks,
+            },
         )
 
-    def _expand_answer_if_needed(self, qa_result: QAResult, chunk_text: str) -> str:
+    # ── Public method ─────────────────────────────────────────────────────────
+
+    async def dispatch(self, query: str) -> DispatchResult:
+        """
+        Run the full audit pipeline for one query.
+
+        Flow:
+            1. Retrieve Top 20 chunks (FAISS ANN search)
+            2. Re-rank with Cross-Encoder → Top 5 (if enabled)
+            3. Run QA workers concurrently on Top 5
+            4. Apply abstention filter
+            5. RAKE fallback if all rejected
+            6. Deduplicate
+            7. Return VerifiedAnswer list
+
+        Args:
+            query — the audit question string
+
+        Returns:
+            DispatchResult with ranked VerifiedAnswers.
+
+        Raises:
+            NoAnswerFoundError — if no span passes abstention
+                                 even after RAKE fallback.
+        """
+        logger.info(
+            "Dispatch started",
+            extra={"query": query[:80]},
+        )
+
+        # ── Pass 1: Retrieve → Re-rank → QA ──────────────────────────────────
+        chunks, reranked = await self._retrieve_and_rerank(query)
+        worker_results   = await self._run_workers(query, chunks)
+        qa_results       = [
+            r.qa_result for r in worker_results
+            if r.success and r.qa_result
+        ]
+        accepted = self._abstention.filter(qa_results)
+
+        rake_used = False
+
+        # ── Pass 2: RAKE fallback ─────────────────────────────────────────────
+        if not accepted:
+            logger.info(
+                "All spans rejected — triggering RAKE fallback",
+                extra={"query": query[:80]},
+            )
+            reformulated = self._rake.reformulate(query)
+
+            if reformulated != query:
+                rake_used = True
+                chunks, reranked = await self._retrieve_and_rerank(reformulated)
+                worker_results   = await self._run_workers(reformulated, chunks)
+                qa_results       = [
+                    r.qa_result for r in worker_results
+                    if r.success and r.qa_result
+                ]
+                accepted = self._abstention.filter(qa_results)
+
+        # ── No answer found ───────────────────────────────────────────────────
+        if not accepted:
+            raise NoAnswerFoundError(query)
+
+        # ── Deduplicate ───────────────────────────────────────────────────────
+        unique = self._deduplicator.deduplicate(accepted)
+
+        # ── Build chunk lookup for source attribution ─────────────────────────
+        chunk_map = self._build_chunk_map(worker_results)
+
+        # ── Build VerifiedAnswer list ─────────────────────────────────────────
+        answers: list[VerifiedAnswer] = []
+        for qa_result in unique:
+            source_chunk = chunk_map.get(id(qa_result))
+            if source_chunk is None:
+                continue
+
+            # EXPAND THE ANSWER HERE
+            expanded_text = self._expand_answer_if_needed(qa_result, source_chunk.text)
+
+            answers.append(VerifiedAnswer(
+                text=expanded_text,
+                span_score=round(qa_result.span_score, 6),
+                null_score=round(qa_result.null_score, 6),
+                rerank_score=round(getattr(source_chunk, "rerank_score", 0.0), 6),
+                filename=source_chunk.filename,
+                page_number=source_chunk.page_number,
+                bbox=source_chunk.bbox,
+                chunk_text=source_chunk.text,
+                span_hash=sha256_hash(normalize_span(qa_result.answer)),
+                rake_used=rake_used,
+            ))
+
+        total_searched = len(worker_results)
+
+        logger.info(
+            "Dispatch complete",
+            extra={
+                "query":           query[:80],
+                "answers":         len(answers),
+                "rake_used":       rake_used,
+                "reranked":        reranked,
+                "chunks_searched": total_searched,
+            },
+        )
+
+        return DispatchResult(
+            answers=answers,
+            query=query,
+            rake_used=rake_used,
+            total_chunks_searched=total_searched,
+            reranked=reranked,
+        )
+
+    # ── Internal helpers ──────────────────────────────────────────────────────
+
+    def _expand_answer_if_needed(self, qa_result, chunk_text: str) -> str:
         """
         Intelligently expand short answers to provide more context.
         Generic approach that works for any document.
@@ -130,6 +264,8 @@ class AuditDispatcher:
         3. If answer is still short, expand to context window around answer
         4. Fallback to first meaningful sentence from chunk
         """
+        import re
+        
         # Strategy 1: Keep substantial answers (over 100 chars)
         if len(qa_result.answer) >= 100:
             return qa_result.answer
@@ -201,116 +337,62 @@ class AuditDispatcher:
         
         return qa_result.answer
 
-    async def dispatch(self, query: str) -> DispatchResult:
+    async def _retrieve_and_rerank(
+        self,
+        query: str,
+    ) -> tuple[list[RetrievedChunk], bool]:
         """
-        Run the full audit pipeline for one query.
+        Retrieve candidate chunks then apply Cross-Encoder re-ranking.
+
+        Steps:
+            1. FAISS retrieves Top 20 (retrieval_top_k)
+            2. Cross-Encoder scores each (query, chunk) pair
+            3. Returns Top 5 (top_k_chunks) sorted by rerank_score
+
+        If rerank_enabled=False, returns raw FAISS Top 5 directly.
 
         Args:
-            query — the audit question string
+            query — the question string
 
         Returns:
-            DispatchResult with ranked VerifiedAnswers.
-
-        Raises:
-            NoAnswerFoundError — if no span passes abstention
-                                 even after RAKE fallback.
+            (chunks, reranked_flag)
+            chunks       — list[RetrievedChunk] ready for QA workers
+            reranked_flag— True if Cross-Encoder was applied
         """
-        logger.info("Dispatch started", extra={"query": query[:80]})
-
-        # ── Pass 1: Standard retrieval + QA ───────────────────────────────────
+        # Step 1: FAISS retrieval — wide candidate pool
         chunks = await self._retriever.retrieve(query)
-        worker_results = await self._run_workers(query, chunks)
-        qa_results = [r.qa_result for r in worker_results if r.success and r.qa_result]
-        accepted = self._abstention.filter(qa_results)
 
-        rake_used = False
+        if not chunks:
+            return [], False
 
-        # ── Pass 2: RAKE fallback (if all spans rejected) ─────────────────────
-        if not accepted:
-            logger.info(
-                "All spans rejected — triggering RAKE fallback",
-                extra={"query": query[:80]},
+        # Step 2: Cross-Encoder re-ranking (if enabled)
+        if self._reranker is not None and settings.rerank_enabled:
+            loop = asyncio.get_event_loop()
+            # Run CPU-bound Cross-Encoder in thread pool
+            chunks = await loop.run_in_executor(
+                self._executor,
+                self._reranker.rerank,
+                query,
+                chunks,
+                settings.top_k_chunks,
             )
-            reformulated = self._rake.reformulate(query)
+            return chunks, True
 
-            if reformulated != query:
-                rake_used = True
-                chunks = await self._retriever.retrieve(reformulated)
-                worker_results = await self._run_workers(reformulated, chunks)
-                qa_results = [
-                    r.qa_result for r in worker_results
-                    if r.success and r.qa_result
-                ]
-                accepted = self._abstention.filter(qa_results)
-
-        # ── No answer found ───────────────────────────────────────────────────
-        if not accepted:
-            raise NoAnswerFoundError(query)
-
-        # ── Deduplicate ───────────────────────────────────────────────────────
-        unique = self._deduplicator.deduplicate(accepted)
-
-        # ── Build chunk lookup for source attribution ──────────────────────────
-        chunk_map = self._build_chunk_map(worker_results)
-
-        # ── Build VerifiedAnswer list ──────────────────────────────────────────
-        from core.utils import normalize_span, sha256_hash
-
-        answers: list[VerifiedAnswer] = []
-        for qa_result in unique:
-            source_chunk = chunk_map.get(id(qa_result))
-            if source_chunk is None:
-                continue
-
-            # Expand short answers if needed (generic approach)
-            expanded_text = self._expand_answer_if_needed(qa_result, source_chunk.text)
-
-            answers.append(VerifiedAnswer(
-                text=expanded_text,
-                span_score=round(qa_result.span_score, 6),
-                null_score=round(qa_result.null_score, 6),
-                filename=source_chunk.filename,
-                page_number=source_chunk.page_number,
-                bbox=source_chunk.bbox,
-                chunk_text=source_chunk.text,
-                span_hash=sha256_hash(normalize_span(qa_result.answer)),
-                rake_used=rake_used,
-            ))
-
-        total_searched = len(worker_results)
-
-        logger.info(
-            "Dispatch complete",
-            extra={
-                "query": query[:80],
-                "answers": len(answers),
-                "rake_used": rake_used,
-                "chunks_searched": total_searched,
-            },
-        )
-
-        return DispatchResult(
-            answers=answers,
-            query=query,
-            rake_used=rake_used,
-            total_chunks_searched=total_searched,
-        )
+        # Fallback: no re-ranker — slice raw FAISS results to top_k_chunks
+        return chunks[:settings.top_k_chunks], False
 
     async def _run_workers(
         self,
         question: str,
-        chunks: list[RetrievedChunk],
+        chunks:   list[RetrievedChunk],
     ) -> list[WorkerResult]:
         """
         Run QA concurrently on all chunks using asyncio.gather.
-
-        All workers start simultaneously. Results preserve
-        the order of the input chunks.
         """
         if not chunks:
             return []
 
-        tasks = [self._worker.run(question, chunk) for chunk in chunks]
+        tasks   = [self._worker.run(question, chunk) for chunk in chunks]
         results = await asyncio.gather(*tasks, return_exceptions=False)
         return list(results)
 
@@ -319,8 +401,7 @@ class AuditDispatcher:
         worker_results: list[WorkerResult],
     ) -> dict[int, RetrievedChunk]:
         """
-        Build a map from QAResult object id → RetrievedChunk.
-        Used to trace each answer back to its source document.
+        Map QAResult object id → RetrievedChunk for source attribution.
         """
         mapping = {}
         for wr in worker_results:
